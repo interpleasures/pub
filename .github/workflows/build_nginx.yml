@@ -1,0 +1,191 @@
+name: 构建Nginx
+
+on:
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: '目标系统架构 (amd64 或 arm64)'
+        required: true
+        default: 'amd64'
+        type: choice
+        options:
+          - amd64
+          - arm64
+
+env:
+  APP_NAME: nginx
+  PUBLIC_REPO: pub
+  USERNAME: interpleasures
+  TEMP_BUILD_DIR: tmp_build_nginx
+
+jobs:
+  build-and-deploy:
+    name: 构建与发布
+    runs-on: ${{ inputs.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    permissions:
+      contents: write
+
+    steps:
+      - name: 检出当前仓库
+        uses: actions/checkout@v4
+      
+      - name: 获取最新的 Nginx 稳定版本
+        id: get_nginx_version
+        run: |
+          if ! command -v jq &> /dev/null; then
+              sudo apt-get update && sudo apt-get install -y jq
+          fi
+          API_URL="https://api.github.com/repos/nginx/nginx/releases"
+          RELEASE_DATA=$(curl -s $API_URL | jq -r 'map(select(.prerelease == false)) | .[0]')
+          LATEST_TAG=$(echo $RELEASE_DATA | jq -r '.tag_name')
+          if [ "$LATEST_TAG" == "null" ] || [ -z "$LATEST_TAG" ]; then
+            echo "错误: 无法获取最新的 Nginx 稳定版本"
+            exit 1
+          fi          
+          LATEST_VER=$(echo $LATEST_TAG | sed 's/^release-//')
+          DOWNLOAD_URL=$(echo $RELEASE_DATA | jq -r '.tarball_url')
+          
+          echo "LATEST_VER=$LATEST_VER" >> $GITHUB_ENV
+          echo "DOWNLOAD_URL=$DOWNLOAD_URL" >> $GITHUB_ENV
+          echo "检测到版本: $LATEST_VER"
+
+      # 优化：不再需要 QEMU，因为我们现在使用的是原生架构机器构建
+
+      - name: 设置环境变量
+        run: |
+          if [ "${{ inputs.arch }}" == "amd64" ]; then
+            echo "ARCH_SUFFIX=linux-amd64" >> $GITHUB_ENV
+            echo "DOCKER_PLATFORM=linux/amd64" >> $GITHUB_ENV
+          else
+            echo "ARCH_SUFFIX=linux-arm64" >> $GITHUB_ENV
+            echo "DOCKER_PLATFORM=linux/arm64" >> $GITHUB_ENV
+          fi
+
+      - name: 在 Docker 中构建 Nginx
+        # 优化：由于 Runner 架构与目标架构一致，无需 QEMU 模拟，构建速度大幅提升
+        run: |
+          mkdir -p ${{ env.TEMP_BUILD_DIR }}
+          # 显式指定 platform，虽然原生环境下 docker 默认会用 host 架构，但指定更保险
+          docker run --rm --platform ${{ env.DOCKER_PLATFORM }} \
+            -v ${{ github.workspace }}/${{ env.TEMP_BUILD_DIR }}:/workspace \
+            debian:10-slim \
+            /bin/bash -c '
+              set -e
+              echo "deb http://archive.debian.org/debian buster main" > /etc/apt/sources.list
+              echo "deb http://archive.debian.org/debian-security buster/updates main" >> /etc/apt/sources.list
+              apt-get -o Acquire::Check-Valid-Until=false update
+              apt-get install -y --no-install-recommends build-essential perl wget curl file ca-certificates
+              mkdir -p /tmp/build
+              cd /tmp/build
+              wget -q --no-check-certificate https://www.openssl.org/source/openssl-3.0.15.tar.gz && tar -zxf openssl-3.0.15.tar.gz
+              wget -q --no-check-certificate https://sourceforge.net/projects/pcre/files/pcre/8.45/pcre-8.45.tar.gz && tar -zxf pcre-8.45.tar.gz
+              wget -q --no-check-certificate https://zlib.net/zlib-1.3.1.tar.gz && tar -zxf zlib-1.3.1.tar.gz
+              wget -q -O nginx.tar.gz "${{ env.DOWNLOAD_URL }}"
+              mkdir nginx-source
+              tar -zxf nginx.tar.gz --strip-components 1 -C nginx-source
+              EXTRACTED_DIR="nginx-source"
+              NGINX_ROOT_DIR="/tmp/build/$EXTRACTED_DIR"
+              cd "$NGINX_ROOT_DIR"
+              chmod +x ./auto/configure
+              ./auto/configure \
+                --build="Custom-Build" \
+                --prefix=/xiao/reproxy \
+                --sbin-path=/xiao/reproxy/sbin/nginx \
+                --conf-path=/xiao/reproxy/conf/nginx.conf \
+                --error-log-path=/xiao/reproxy/logs/error.log \
+                --http-log-path=/xiao/reproxy/logs/access.log \
+                --pid-path=/xiao/reproxy/logs/nginx.pid \
+                --lock-path=/xiao/reproxy/logs/nginx.lock \
+                --http-client-body-temp-path=/xiao/reproxy/temp/client_body \
+                --http-proxy-temp-path=/xiao/reproxy/temp/proxy \
+                --http-fastcgi-temp-path=/xiao/reproxy/temp/fastcgi \
+                --http-uwsgi-temp-path=/xiao/reproxy/temp/uwsgi \
+                --http-scgi-temp-path=/xiao/reproxy/temp/scgi \
+                --with-http_ssl_module \
+                --with-http_v2_module \
+                --with-http_realip_module \
+                --with-http_gzip_static_module \
+                --with-http_stub_status_module \
+                --with-threads \
+                --with-pcre=../pcre-8.45 \
+                --with-zlib=../zlib-1.3.1 \
+                --with-openssl=../openssl-3.0.15 \
+                --with-cc-opt="-O2 -g0" \
+                --with-ld-opt="-s -static-libgcc"
+              sed -i "s|#define NGX_COMPILER .*|#define NGX_COMPILER  \"gcc\"|" objs/ngx_auto_config.h
+              make -j$(nproc)
+              make install
+              rm /xiao/reproxy/html/50x.html /xiao/reproxy/html/index.html
+              cd /xiao/reproxy/conf
+              rm -f *.default fastcgi.conf scgi_params 
+              rm -f koi-utf koi-win win-utf
+              for f in *; do > "$f"; done
+          cat <<EOF > /xiao/reproxy/conf/nginx.conf
+          worker_processes auto;       # 自动根据 CPU 核心数设置工作进程
+          events {
+              use epoll;               # Linux 平台最佳性能模型
+              multi_accept on;         # 允许瞬间高并发连接
+              worker_connections 4096; # 单个进程最大连接数
+          }
+          http {
+              include             mime.types;
+              default_type        application/octet-stream;
+              sendfile            on;
+              keepalive_timeout   65;
+          }
+          EOF
+              mkdir -p /xiao/reproxy/temp/client_body
+              mkdir -p /xiao/reproxy/temp/proxy
+              mkdir -p /xiao/reproxy/temp/fastcgi
+              mkdir -p /xiao/reproxy/temp/uwsgi
+              mkdir -p /xiao/reproxy/temp/scgi
+              cd /
+              TAR_FILENAME="${{ env.APP_NAME }}-${{ env.ARCH_SUFFIX }}.tar.gz"
+              tar -czvf /workspace/$TAR_FILENAME \
+                  --owner=0 --group=0 \
+                  xiao/reproxy
+            '
+
+      - name: 确定生成的文件名
+        run: |
+          FILE_PATH=$(find ${{ env.TEMP_BUILD_DIR }} -name "*.tar.gz" -type f | head -n 1)
+          if [ -z "$FILE_PATH" ]; then
+            echo "错误: 未找到构建产物"
+            exit 1
+          fi
+          echo "FILE_TO_PUSH=$FILE_PATH" >> $GITHUB_ENV
+
+      - name: 测量文件大小
+        run: |
+          FILE_PATH="${{ env.FILE_TO_PUSH }}"
+          BYTES=$(stat -c '%s' "$FILE_PATH")
+          SIZE=$(awk -v b="$BYTES" 'BEGIN{
+            if (b >= 1048576) printf("%.2f MB", b/1048576);
+            else if (b >= 1024) printf("%.2f KB", b/1024);
+            else printf("%d B", b)
+          }')
+          echo "FILE_SIZE=$SIZE" >> $GITHUB_ENV
+
+      - name: 发布到外部仓库
+        run: |
+          TARGET_FILE_PATH="${{ env.FILE_TO_PUSH }}"
+          TARGET_FILE_NAME=$(basename "$TARGET_FILE_PATH")
+          git clone "https://x-access-token:${{ secrets.GH_TOKEN }}@github.com/${{ env.USERNAME }}/${{ env.PUBLIC_REPO }}.git" public_repo
+          mkdir -p public_repo/programs
+          cp "$TARGET_FILE_PATH" "public_repo/programs/$TARGET_FILE_NAME"
+          cd public_repo
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "programs/$TARGET_FILE_NAME"
+          if git status --porcelain | grep .; then
+            git commit -m "版本：${{ env.LATEST_VER }} 架构: ${{ inputs.arch }} 大小: ${{ env.FILE_SIZE }}"
+            git push
+          else
+            echo "文件无变化，跳过提交"
+          fi
+
+      - name: 清理临时目录
+        if: always()
+        run: |
+          rm -rf ${{ env.TEMP_BUILD_DIR }}
+          rm -rf public_repo
