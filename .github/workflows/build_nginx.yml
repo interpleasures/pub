@@ -4,11 +4,6 @@ on:
   push:
     branches:
       - master
-      - main
-  pull_request:
-    branches:
-      - master
-      - main
   workflow_dispatch:
     inputs:
       arch:
@@ -173,6 +168,10 @@ jobs:
             else printf("%d B", b)
           }')
           echo "FILE_SIZE=$SIZE" >> $GITHUB_ENV
+      - name: Checkout main branch
+        uses: actions/checkout@v2
+        with:
+          ref: main 
 
       - name: 发布到外部仓库
         run: |
