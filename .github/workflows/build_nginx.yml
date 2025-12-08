@@ -17,8 +17,6 @@ on:
 
 env:
   APP_NAME: nginx
-  PUBLIC_REPO: pub
-  USERNAME: interpleasures
   TEMP_BUILD_DIR: tmp_build_nginx
 
 jobs:
@@ -26,10 +24,10 @@ jobs:
     name: 构建与发布
     runs-on: ${{ inputs.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     permissions:
-      contents: write
+      contents: write # 必须要给予写权限才能推送到 main 分支
 
     steps:
-      - name: 检出当前仓库
+      - name: 检出代码 (Master)
         uses: actions/checkout@v4
       
       - name: 获取最新的 Nginx 稳定版本
@@ -52,11 +50,13 @@ jobs:
           echo "DOWNLOAD_URL=$DOWNLOAD_URL" >> $GITHUB_ENV
           echo "检测到版本: $LATEST_VER"
 
-      # 优化：不再需要 QEMU，因为我们现在使用的是原生架构机器构建
-
-      - name: 设置环境变量
+      - name: 设置架构环境变量
         run: |
-          if [ "${{ inputs.arch }}" == "amd64" ]; then
+          # 如果是手动触发，使用 input，如果是 push 触发，默认 amd64 (或者你可以自定义逻辑)
+          ARCH="${{ inputs.arch }}"
+          if [ -z "$ARCH" ]; then ARCH="amd64"; fi
+          
+          if [ "$ARCH" == "amd64" ]; then
             echo "ARCH_SUFFIX=linux-amd64" >> $GITHUB_ENV
             echo "DOCKER_PLATFORM=linux/amd64" >> $GITHUB_ENV
           else
@@ -65,10 +65,8 @@ jobs:
           fi
 
       - name: 在 Docker 中构建 Nginx
-        # 优化：由于 Runner 架构与目标架构一致，无需 QEMU 模拟，构建速度大幅提升
         run: |
           mkdir -p ${{ env.TEMP_BUILD_DIR }}
-          # 显式指定 platform，虽然原生环境下 docker 默认会用 host 架构，但指定更保险
           docker run --rm --platform ${{ env.DOCKER_PLATFORM }} \
             -v ${{ github.workspace }}/${{ env.TEMP_BUILD_DIR }}:/workspace \
             debian:10-slim \
@@ -124,11 +122,11 @@ jobs:
               rm -f koi-utf koi-win win-utf
               for f in *; do > "$f"; done
           cat <<EOF > /xiao/reproxy/conf/nginx.conf
-          worker_processes auto;       # 自动根据 CPU 核心数设置工作进程
+          worker_processes auto;
           events {
-              use epoll;               # Linux 平台最佳性能模型
-              multi_accept on;         # 允许瞬间高并发连接
-              worker_connections 4096; # 单个进程最大连接数
+              use epoll;
+              multi_accept on;
+              worker_connections 4096;
           }
           http {
               include             mime.types;
@@ -149,7 +147,7 @@ jobs:
                   xiao/reproxy
             '
 
-      - name: 确定生成的文件名
+      - name: 确定产物路径与大小
         run: |
           FILE_PATH=$(find ${{ env.TEMP_BUILD_DIR }} -name "*.tar.gz" -type f | head -n 1)
           if [ -z "$FILE_PATH" ]; then
@@ -157,10 +155,7 @@ jobs:
             exit 1
           fi
           echo "FILE_TO_PUSH=$FILE_PATH" >> $GITHUB_ENV
-
-      - name: 测量文件大小
-        run: |
-          FILE_PATH="${{ env.FILE_TO_PUSH }}"
+          
           BYTES=$(stat -c '%s' "$FILE_PATH")
           SIZE=$(awk -v b="$BYTES" 'BEGIN{
             if (b >= 1048576) printf("%.2f MB", b/1048576);
@@ -168,25 +163,39 @@ jobs:
             else printf("%d B", b)
           }')
           echo "FILE_SIZE=$SIZE" >> $GITHUB_ENV
-      - name: Checkout main branch
-        uses: actions/checkout@v2
-        with:
-          ref: main 
 
-      - name: 发布到外部仓库
+      # 关键修改：检出 main 分支到一个子目录，避免覆盖当前的构建产物
+      - name: 检出 Main 分支
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          path: main_branch
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 提交并推送到 Main 分支
         run: |
           TARGET_FILE_PATH="${{ env.FILE_TO_PUSH }}"
           TARGET_FILE_NAME=$(basename "$TARGET_FILE_PATH")
-          git clone "https://x-access-token:${{ secrets.GH_TOKEN }}@github.com/${{ env.USERNAME }}/${{ env.PUBLIC_REPO }}.git" public_repo
-          mkdir -p public_repo/programs
-          cp "$TARGET_FILE_PATH" "public_repo/programs/$TARGET_FILE_NAME"
-          cd public_repo
+          
+          # 确保目标目录存在 (在 main 分支的目录中)
+          mkdir -p main_branch/programs
+          
+          # 复制构建产物到 main 分支目录
+          cp "$TARGET_FILE_PATH" "main_branch/programs/$TARGET_FILE_NAME"
+          
+          cd main_branch
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          
           git add "programs/$TARGET_FILE_NAME"
+          
+          # 检查是否有变更，有变更才提交
           if git status --porcelain | grep .; then
-            git commit -m "版本：${{ env.LATEST_VER }} 架构: ${{ inputs.arch }} 大小: ${{ env.FILE_SIZE }}"
-            git push
+            ARCH="${{ inputs.arch }}"
+            [ -z "$ARCH" ] && ARCH="amd64"
+            git commit -m "自动构建: Nginx ${{ env.LATEST_VER }} ($ARCH) - 大小: ${{ env.FILE_SIZE }}"
+            git push origin main
+            echo "推送成功"
           else
             echo "文件无变化，跳过提交"
           fi
@@ -195,4 +204,4 @@ jobs:
         if: always()
         run: |
           rm -rf ${{ env.TEMP_BUILD_DIR }}
-          rm -rf public_repo
+          rm -rf main_branch
